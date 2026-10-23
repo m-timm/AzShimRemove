@@ -66,3 +66,7 @@ Run it once per subscription AzShim was deployed to.
 ## Warning
 
 This permanently deletes resource groups. Use `-n` first and read the output.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
