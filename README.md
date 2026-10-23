@@ -16,7 +16,7 @@ Unofficial and not affiliated with or supported by Blumira.
 
 Deleting the resource group removes the namespace, event hub and SAS rule together.
 
-It also finds diagnostic settings (subscription, Entra ID tenant, and with `-d` resource level) that stream to the namespaces being removed, even if they were created manually under another name.
+It also finds diagnostic settings (subscription, Entra ID tenant, and with `-d` resource level) that stream to the namespaces being removed, even if they were created manually under another name. Entra ID diagnostic settings are also removed when their name contains "blumira" (e.g. the KB's "Blumira events"), or when they stream to any `blumiraeventhubns-*` namespace, even if its resource group is already deleted. Reading and deleting Entra settings needs Global Administrator or Security Administrator.
 
 Order of operations: diagnostic settings first, then resource groups, so nothing is left pointing at a deleted event hub.
 

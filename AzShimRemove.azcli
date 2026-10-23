@@ -82,6 +82,8 @@ function points_at_target() {
     local rule
     rule=$(lc "$1")
     [[ -z "$rule" || "$rule" == "null" || "$rule" == "none" ]] && return 1
+    # Matches AzShim's namespace naming, so this still works if the namespace is already gone
+    [[ "$rule" == */namespaces/${NS_PREFIX}-* ]] && return 0
     local ns
     for ns in "${TARGET_NS_IDS[@]}"; do
         [[ "$rule" == "$ns"* ]] && return 0
@@ -204,9 +206,10 @@ function RemoveEntraDiag() {
     for line in "${lines[@]}"; do
         IFS=$'\t' read -r name rule <<< "$line"
         [ -z "$name" ] && continue
-        if points_at_target "$rule"; then
+        # Match by destination, or by name (Blumira's KB suggests naming it "Blumira events")
+        if points_at_target "$rule" || [[ "$(lc "$name")" == *blumira* ]]; then
             found=1
-            echo "Removing Entra diagnostic setting: ${name}"
+            echo "Removing Entra diagnostic setting: ${name} -> ${rule:-<no event hub>}"
             if ! do_or_say az rest --method delete \
                 --url "${url}/${name// /%20}?api-version=${ENTRA_API}" 2> /dev/null; then
                 echo "  WARNING: failed to remove '${name}'. Remove it in the Entra admin center."
@@ -214,7 +217,7 @@ function RemoveEntraDiag() {
             fi
         fi
     done
-    [ $found -eq 0 ] && echo "None found pointing at the targeted namespaces."
+    [ $found -eq 0 ] && echo "None found (no Blumira-named setting, none pointing at a Blumira namespace)."
 }
 
 function DeepScan() {
