@@ -31,7 +31,7 @@ Order of operations: diagnostic settings first, then resource groups, so nothing
 Paste into Azure Cloud Shell (Bash):
 
 ```
-git clone https://github.com/<your-account>/AzShimRemove.git
+git clone https://github.com/m-timm/AzShimRemove.git
 cd ./AzShimRemove
 chmod +x ./AzShimRemove.azcli
 ./AzShimRemove.azcli -n
