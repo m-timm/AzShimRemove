@@ -1,0 +1,366 @@
+#!/bin/bash
+# AzShimRemove.azcli - the antithesis of Blumira's AzShim.azcli
+# Version: 1.0.0
+#
+# Purpose: Remove everything AzShim.azcli -c creates in an Azure subscription, plus
+# (optionally discovered) diagnostic settings that stream into the namespaces being removed.
+#
+# What AzShim v3 creates (and what this script removes):
+#   - Resource group        blumira-rg-<epoch>
+#   - Event Hubs namespace  blumiraeventhubns-<region>-<epoch>   (inside that RG)
+#   - Event hub             blumiraeventhub-<region>-<epoch>     (inside that namespace)
+#   - Listen SAS rule       LogsToBlumira-<epoch>                (inside that event hub)
+#   - Subscription diag     BlumiraDiagSetting-<epoch>           (Activity Log -> event hub)
+# Deleting the resource group removes the namespace, event hub and SAS rule in one shot.
+#
+# What it ALSO finds by looking at where diagnostic settings point (manual setups from the
+# Blumira KB article, e.g. Entra ID "Blumira events"):
+#   - Subscription-level diagnostic settings pointing at a removed namespace
+#   - Entra ID (tenant) diagnostic settings pointing at a removed namespace
+#   - (-d) Resource-level diagnostic settings pointing at a removed namespace
+#
+# Order matters: diagnostic settings are removed FIRST, then the resource groups, so nothing
+# is left pointing at a deleted event hub.
+#
+# Run it the same way as AzShim: Azure Cloud Shell (Bash) or any bash 4+ shell with Azure CLI.
+#   chmod +x ./AzShimRemove.azcli
+#   ./AzShimRemove.azcli -n      # dry run, shows what WOULD be removed
+#   ./AzShimRemove.azcli -r      # interactive removal
+
+# Names must match AzShim.azcli
+RG_PREFIX="blumira-rg"
+NS_PREFIX="blumiraeventhubns"
+SUBDIAG_PREFIX="BlumiraDiagSetting"
+ENTRA_API="2017-04-01"
+
+DRY_RUN=false
+ASSUME_YES=false
+DEEP_SCAN=false
+EXPLICIT_RG=""
+RUN=false
+TARGET_RGS=()
+TARGET_NS_IDS=()   # lowercased namespace resource IDs
+MANUAL_CHECKS=()
+
+function Help() {
+    echo "AzShimRemove removes the Azure resources created by Blumira's AzShim script."
+    echo
+    echo "Usage: AzShimRemove.azcli [-r] [-n] [-y] [-d] [-g <resource-group>] [-h]"
+    echo "  -r   Run the removal (interactive: pick subscription, confirm deletions)"
+    echo "  -n   Dry run: show what would be removed, change nothing (implies -r)"
+    echo "  -y   Assume yes on confirmations. Resource groups holding anything other than"
+    echo "       Event Hubs namespaces are still skipped."
+    echo "  -d   Deep scan: also check every resource's diagnostic settings (slow)"
+    echo "  -g   Target one specific resource group instead of matching ${RG_PREFIX}-<epoch>"
+    echo "  -h   Show this help"
+    echo
+    echo "Needs bash 4+ and Azure CLI. Run from Azure Cloud Shell (Bash) for the same experience as AzShim."
+    echo "Run it once per subscription AzShim was deployed to."
+}
+
+function lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+function clean() { tr -d '\r'; }
+
+function confirm() {
+    ($ASSUME_YES || $DRY_RUN) && return 0
+    local ans
+    read -r -p "$1 [y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+# Runs a command, or just prints it during a dry run
+function do_or_say() {
+    if $DRY_RUN; then
+        echo "  [dry-run] $*"
+        return 0
+    fi
+    "$@"
+}
+
+# True if a diagnostic setting's event hub auth rule ID lives under a namespace being removed
+function points_at_target() {
+    local rule
+    rule=$(lc "$1")
+    [[ -z "$rule" || "$rule" == "null" || "$rule" == "none" ]] && return 1
+    local ns
+    for ns in "${TARGET_NS_IDS[@]}"; do
+        [[ "$rule" == "$ns"* ]] && return 0
+    done
+    return 1
+}
+
+function Preflight() {
+    if ! command -v az > /dev/null 2>&1; then
+        echo "Azure CLI (az) not found. Use Azure Cloud Shell (Bash) or install Azure CLI."
+        exit 1
+    fi
+    if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+        echo "bash 4+ is required (found ${BASH_VERSION}). Use Azure Cloud Shell (Bash)."
+        exit 1
+    fi
+    if ! az account show > /dev/null 2>&1; then
+        echo "Not logged in to Azure. Run 'az login' first."
+        exit 1
+    fi
+}
+
+function SelectSubscription() {
+    local names=() ids=() n i
+    while IFS=$'\t' read -r n i; do
+        names+=("$n")
+        ids+=("$i")
+    done < <(az account list --query "[?state=='Enabled'].[name,id]" -o tsv | clean)
+
+    if [ ${#names[@]} -eq 0 ]; then
+        echo "No enabled subscriptions found."
+        exit 1
+    fi
+
+    echo 'Please select a subscription by choosing the number that corresponds to your selection:'
+    PS3="Subscription #: "
+    select n in "${names[@]}"; do
+        if [ -z "$n" ]; then
+            echo "Invalid option $REPLY, please select a valid option"
+            continue
+        fi
+        SUB_NAME="$n"
+        SUB_ID="${ids[$((REPLY - 1))]}"
+        break
+    done
+
+    az account set --subscription "$SUB_ID" > /dev/null || exit 1
+    echo "Using subscription: ${SUB_NAME} (${SUB_ID})"
+}
+
+# Finds the AzShim resource groups and records every namespace inside them
+function FindTargets() {
+    local rg id lines=()
+    TARGET_RGS=()
+    TARGET_NS_IDS=()
+
+    if [ -n "$EXPLICIT_RG" ]; then
+        if ! az group show --name "$EXPLICIT_RG" > /dev/null 2>&1; then
+            echo "Resource group '${EXPLICIT_RG}' not found in this subscription."
+            exit 1
+        fi
+        TARGET_RGS+=("$EXPLICIT_RG")
+    else
+        mapfile -t lines < <(az group list --query "[?starts_with(name, '${RG_PREFIX}-')].name" -o tsv | clean)
+        for rg in "${lines[@]}"; do
+            # Only exact AzShim pattern: blumira-rg-<epoch>
+            [[ "$rg" =~ ^${RG_PREFIX}-[0-9]+$ ]] && TARGET_RGS+=("$rg")
+        done
+    fi
+
+    echo
+    echo "== Resource groups targeted for removal =="
+    if [ ${#TARGET_RGS[@]} -eq 0 ]; then
+        echo "None matching '${RG_PREFIX}-<epoch>'. Use -g <name> if AzShim was customized."
+    fi
+
+    for rg in "${TARGET_RGS[@]}"; do
+        echo "  ${rg}"
+        mapfile -t lines < <(az eventhubs namespace list --resource-group "$rg" --query "[].id" -o tsv | clean)
+        for id in "${lines[@]}"; do
+            [ -n "$id" ] && TARGET_NS_IDS+=("$(lc "$id")") && echo "    namespace: ${id##*/}"
+        done
+    done
+}
+
+function RemoveSubscriptionDiag() {
+    echo
+    echo "== Subscription-level diagnostic settings (Activity Log) =="
+    local lines=() line name rule found=0
+    mapfile -t lines < <(az monitor diagnostic-settings subscription list \
+        --query "value[].[name, eventHubAuthorizationRuleId]" -o tsv 2> /dev/null | clean)
+    for line in "${lines[@]}"; do
+        IFS=$'\t' read -r name rule <<< "$line"
+        [ -z "$name" ] && continue
+        if [[ "$name" == ${SUBDIAG_PREFIX}-* ]] || points_at_target "$rule"; then
+            found=1
+            echo "Removing subscription diagnostic setting: ${name}"
+            do_or_say az monitor diagnostic-settings subscription delete --name "$name" --yes \
+                || echo "  WARNING: failed to remove '${name}'"
+        fi
+    done
+    [ $found -eq 0 ] && echo "None found."
+}
+
+function RemoveEntraDiag() {
+    echo
+    echo "== Entra ID (tenant) diagnostic settings =="
+    local url="https://management.azure.com/providers/microsoft.aadiam/diagnosticSettings"
+    local out lines=() line name rule found=0
+
+    if ! out=$(az rest --method get --url "${url}?api-version=${ENTRA_API}" \
+        --query "value[].[name, properties.eventHubAuthorizationRuleId]" -o tsv 2> /dev/null); then
+        echo "Could not read Entra diagnostic settings (needs Global Administrator or Security"
+        echo "Administrator, and access to Entra monitoring). Check this one manually."
+        MANUAL_CHECKS+=("Entra admin center > Monitoring & health > Diagnostic settings: delete any setting (e.g. 'Blumira events') streaming to the removed namespace.")
+        return
+    fi
+
+    mapfile -t lines < <(printf '%s\n' "$out" | clean)
+    for line in "${lines[@]}"; do
+        IFS=$'\t' read -r name rule <<< "$line"
+        [ -z "$name" ] && continue
+        if points_at_target "$rule"; then
+            found=1
+            echo "Removing Entra diagnostic setting: ${name}"
+            if ! do_or_say az rest --method delete \
+                --url "${url}/${name// /%20}?api-version=${ENTRA_API}" 2> /dev/null; then
+                echo "  WARNING: failed to remove '${name}'. Remove it in the Entra admin center."
+                MANUAL_CHECKS+=("Entra diagnostic setting '${name}' could not be removed automatically.")
+            fi
+        fi
+    done
+    [ $found -eq 0 ] && echo "None found pointing at the targeted namespaces."
+}
+
+function DeepScan() {
+    echo
+    echo "== Resource-level diagnostic settings (deep scan, this can take a while) =="
+    local resources=() rid lrid skip rg lines=() line name rule found=0
+    mapfile -t resources < <(az resource list --query "[].id" -o tsv | clean)
+    for rid in "${resources[@]}"; do
+        [ -z "$rid" ] && continue
+        lrid=$(lc "$rid")
+        skip=false
+        for rg in "${TARGET_RGS[@]}"; do
+            [[ "$lrid" == "/subscriptions/$(lc "$SUB_ID")/resourcegroups/$(lc "$rg")/"* ]] && skip=true
+        done
+        $skip && continue
+
+        mapfile -t lines < <(az monitor diagnostic-settings list --resource "$rid" \
+            --query "value[].[name, eventHubAuthorizationRuleId]" -o tsv 2> /dev/null < /dev/null | clean)
+        for line in "${lines[@]}"; do
+            IFS=$'\t' read -r name rule <<< "$line"
+            [ -z "$name" ] && continue
+            if points_at_target "$rule"; then
+                found=1
+                echo "Removing '${name}' from ${rid}"
+                do_or_say az monitor diagnostic-settings delete --name "$name" --resource "$rid" < /dev/null \
+                    || echo "  WARNING: failed to remove '${name}'"
+            fi
+        done
+    done
+    [ $found -eq 0 ] && echo "None found."
+}
+
+function RemoveResourceGroups() {
+    echo
+    echo "== Removing resource groups =="
+    local rg types=() t other typed
+    if [ ${#TARGET_RGS[@]} -eq 0 ]; then
+        echo "Nothing to remove."
+        return
+    fi
+
+    for rg in "${TARGET_RGS[@]}"; do
+        echo
+        echo "Resource group: ${rg}"
+        az resource list --resource-group "$rg" --query "[].{Type:type, Name:name}" -o table
+
+        other=false
+        mapfile -t types < <(az resource list --resource-group "$rg" --query "[].type" -o tsv | clean)
+        for t in "${types[@]}"; do
+            [ -z "$t" ] && continue
+            [[ "$(lc "$t")" != "microsoft.eventhub/namespaces" ]] && other=true
+        done
+
+        if $other; then
+            echo "WARNING: '${rg}' contains resources other than Event Hubs namespaces."
+            if $ASSUME_YES; then
+                echo "Skipping '${rg}' (-y will not delete mixed resource groups). Review it and re-run without -y."
+                MANUAL_CHECKS+=("Resource group '${rg}' was skipped because it holds non-Event Hubs resources.")
+                continue
+            fi
+            if $DRY_RUN; then
+                typed="$rg"
+            else
+                read -r -p "Type the resource group name to delete it AND everything in it: " typed
+            fi
+            if [ "$typed" != "$rg" ]; then
+                echo "Skipped '${rg}'."
+                MANUAL_CHECKS+=("Resource group '${rg}' was skipped by choice.")
+                continue
+            fi
+        else
+            confirm "Delete resource group '${rg}'?" || { echo "Skipped '${rg}'."; MANUAL_CHECKS+=("Resource group '${rg}' was skipped by choice."); continue; }
+        fi
+
+        echo "Deleting '${rg}' (namespace, event hub and SAS rules go with it)..."
+        if do_or_say az group delete --name "$rg" --yes; then
+            echo "Done."
+        else
+            echo "WARNING: could not delete '${rg}' (resource lock or missing permissions?)."
+            MANUAL_CHECKS+=("Resource group '${rg}' failed to delete.")
+        fi
+    done
+}
+
+function Summary() {
+    echo
+    echo "******************************************************************"
+    $DRY_RUN && echo "DRY RUN COMPLETE - nothing was changed."
+    echo "Still to check by hand (not removable through Azure CLI):"
+    echo "  - Blumira: Settings > Cloud Connectors > remove the Azure Event Hubs connector(s)."
+    echo "  - Defender portal: Settings > Microsoft Defender XDR > Streaming API; remove any"
+    echo "    setting that targets the removed event hub."
+    echo "  - Intune admin center: Reports > Diagnostics settings; remove any setting that"
+    echo "    targets the removed event hub."
+    echo "  - Other subscriptions: re-run this script once per subscription AzShim was used in."
+    echo "  - The Microsoft.Insights provider registration is intentionally left in place."
+    local m
+    for m in "${MANUAL_CHECKS[@]}"; do
+        echo "  - ${m}"
+    done
+    echo "******************************************************************"
+}
+
+# Main
+while getopts ":hrnydg:" option; do
+    case $option in
+    h) Help; exit 0 ;;
+    r) RUN=true ;;
+    n) DRY_RUN=true; RUN=true ;;
+    y) ASSUME_YES=true ;;
+    d) DEEP_SCAN=true ;;
+    g) EXPLICIT_RG="$OPTARG" ;;
+    :) echo "Option -$OPTARG requires an argument."; exit 1 ;;
+    \?) echo "Invalid option -$OPTARG."; Help; exit 1 ;;
+    esac
+done
+
+if ! $RUN; then
+    Help
+    exit 0
+fi
+
+startDateTime=$(date)
+Preflight
+echo "This will remove the Blumira AzShim resources from ONE subscription."
+$DRY_RUN && echo "DRY RUN: no changes will be made."
+echo
+SelectSubscription
+FindTargets
+
+if [ ${#TARGET_RGS[@]} -eq 0 ] && ! $DEEP_SCAN; then
+    echo
+    echo "No AzShim resource groups found. Still checking for leftover BlumiraDiagSetting-* subscription settings..."
+fi
+
+if ! $DRY_RUN && ! $ASSUME_YES; then
+    echo
+    confirm "Proceed with removal in '${SUB_NAME}'?" || { echo "Aborted."; exit 0; }
+fi
+
+# 1) Remove anything streaming INTO the event hubs, 2) then remove the event hubs
+RemoveSubscriptionDiag
+RemoveEntraDiag
+$DEEP_SCAN && DeepScan
+RemoveResourceGroups
+Summary
+
+echo "Start time: ${startDateTime}"
+echo "End time:   $(date)"
